@@ -1,0 +1,36 @@
+import os
+import json
+
+def main():
+    input_file_path = './components'
+    list_files = os.listdir(input_file_path)
+    parsing_json(list_files)
+
+def parsing_json(file):
+    LIST_OF_THE_DICT = []
+    for component in file:
+        component = os.path.join('components', component)
+        with open(component, encoding="utf8") as f:
+            load = json.load(f)
+            data_currentRootModules = load['release']['currentRootModules']
+            get_report_list(data_currentRootModules, LIST_OF_THE_DICT)
+
+def get_report_list(data_currentRootModules, LIST_OF_THE_DICT):
+    country_capitals = {}
+    module = [x for x in data_currentRootModules]
+    shortcut_module = data_currentRootModules[module[0]]['modules']
+    mod = ''.join(str(e) for e in [x for x in shortcut_module])
+    reports = [x for x in shortcut_module[mod]['reports']]
+    country_capitals[module[0]] = reports
+    if [x for x in shortcut_module[mod]['modules']]:
+        modules  = [x for x in shortcut_module[mod]['modules']]
+        for rep in modules:
+            mod_reports = [x for x in shortcut_module[mod]['modules'][rep]['reports']]
+            for i in mod_reports:
+                reports.append(i)
+        country_capitals[module[0]] = reports
+    LIST_OF_THE_DICT.append(country_capitals)
+    with open("input/spain_templates.json", 'w', encoding='utf-8') as f:
+        json.dump(LIST_OF_THE_DICT, f, ensure_ascii=False, indent=4)
+
+main()
