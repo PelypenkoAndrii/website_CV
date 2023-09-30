@@ -1,0 +1,268 @@
+import pandas as pd
+import json
+import re
+from pathMapper import getAbacusPath
+
+
+VALIDATION_RULE_EXCEL_FILE = 'input/Validation_Rules.xlsx'
+FORMULA_REGEX = '(=|<=|=|\+ |\-|<|>|, +(?={)| \+(?={))'
+CELL_REF_REGEX = '\d{4}'
+COMPONENT_ALLOC = './Component/RUBA_ALLOC.json'
+COMPONENT = './Component/RUBA.json'
+
+
+def getExcelToDataFrame(file):
+    '''
+    Parsing Excel file with validation rules
+    '''
+    df = pd.read_excel(file, sheet_name='Non XBRL', skiprows=range(0, 1))
+    return df
+
+
+def load_json_data(path):
+    ''' Loads the given json file and returns ["release"]["currentFields"], ['release']['currentDomains'],
+    ['release']['currentRootModules']
+    path = location of the file \n
+    returns dict \n
+    '''
+    with open(path, encoding="utf8") as f:
+        load = json.load(f)
+        data_currentFields = load["release"]["currentFields"]
+        data_currentDomains = load['release']['currentDomains']
+        data_currentRootModules = load['release']['currentRootModules']
+        data_currentTemplateSets = load['release']['currentTemplateSets']
+    return data_currentFields, data_currentDomains, data_currentRootModules, data_currentTemplateSets
+
+
+def updatingFormulas(df):
+    '''
+    Return updated df with XML_Rule and XML_Comment columns. XML_Rule and XML_Comment Generated with
+    updatingReportsCellAdress functions and updated by updatingRegionReference function
+    '''
+    file_alloc = load_json_data(COMPONENT_ALLOC)  # Get JSON _ALLOC rest of the logic
+    file = load_json_data(COMPONENT)  # Get JSON with domains and dimensions (fields)
+    full_path = get_rpt_full_path(file_alloc[2])  # Get df with full path to root module for each report
+    dom_df = get_dom_values(file[0], file[1])  # Get list of the domain and domain values with Captions
+    rpt_dim_dom = get_module_reports(file_alloc[3])  # Get list of the reports with dynamic fields
+    df_dim_dom_rpt = pd.merge(dom_df, rpt_dim_dom, on='Dimension', how='outer')
+    df = formula_z_axis_preprocessing(df)  # Preparation of the formula with summarize z axis and with extra z axis
+    for regulator_formula, rule_id in zip(df['Expression'], df['Référence']):
+        parsable_items = re.split((FORMULA_REGEX), regulator_formula)
+        updatingReportsCellAdress(parsable_items, df, rule_id, full_path, df_dim_dom_rpt)
+    df = updatingRegionReference(df)
+    return df
+
+
+def formula_z_axis_preprocessing(df):
+    for regulator_formula, rule_id, dim_z_axis in zip(df['Expression'], df['Référence'], df['Dimensions (axes Z)']):
+        if 'somme' in str(dim_z_axis) and dim_z_axis is not None:
+            dim_z_axis = dim_z_axis[dim_z_axis.rfind('somme') + 6:]
+            split_z_dim = re.split('\+', dim_z_axis)
+            unizone_splitter = re.split(', {', regulator_formula)
+            frm_splitter = re.split('(=|<=|>=|>|<)', '{' + unizone_splitter[1])
+            frm_left = frm_splitter[0]
+            frm_operator = frm_splitter[1]
+            frm_right = frm_splitter[2]
+            # summarize parts with  all z axis
+            def summarize(frm_part):
+                if 'Z(' in frm_part:
+                    frm_part = re.sub('Z\([a-z]+.[a-z]+\)', 'Z(' + split_z_dim[0] + ')', frm_part)
+                else:
+                    frm_part = re.sub(',R|, R', ', Z(' + split_z_dim[0] + '), R', frm_part)
+
+                frm_part_z_1 = frm_part
+                for i in split_z_dim:
+                    if i != split_z_dim[0]:
+                        frm_part_z_2 = re.sub(split_z_dim[0], i, frm_part)
+                frm_part = frm_part_z_1.strip() + ' + ' + frm_part_z_2.strip()
+                return frm_part
+
+            frm_left = summarize(frm_left)
+            frm_right = summarize(frm_right)
+            new_frm = unizone_splitter[0] + ', ' + frm_left + ' ' + frm_operator + ' ' + frm_right
+            df.loc[df['Référence'] == rule_id, 'Expression'] = new_frm
+        elif ',' in str(dim_z_axis):
+            split_z_dim = re.split(',', dim_z_axis)
+            df_1 = pd.DataFrame(df[df['Référence'].str.contains(rule_id)].copy())
+            for i in split_z_dim:
+                new_rule_id = rule_id + '_' + i.strip()
+                new_frm = re.sub(',R|, R', ', Z(' + i.strip() + '), R', str(regulator_formula))
+                if i != split_z_dim[0]:
+                    df_1.loc[df_1['Référence'] == rule_id, 'Expression'] = new_frm
+                    df_1.loc[df_1['Référence'] == rule_id, 'Référence'] = new_rule_id
+                df.loc[df['Référence'] == rule_id, 'Expression'] = new_frm
+                df.loc[df['Référence'] == rule_id, 'Référence'] = new_rule_id
+            df = pd.concat([df_1, df])
+    return df
+
+
+def get_module_reports(currentTemplateSets_data):
+    '''
+    Get Module allocations, Module element, Sub-module element, Report, Dimensions, Allocation report name
+    input: component json file Template sets and Root Modules
+    output: data frame
+    '''
+    rpt_dym_list = []
+    currentTemplateSets = [x for x in currentTemplateSets_data]
+    for currentTemplate in currentTemplateSets:
+        templates = [x for x in currentTemplateSets_data[currentTemplate]['templates']]
+        for temp_elem in templates:
+            cells = [x for x in
+                     currentTemplateSets_data[currentTemplate]['templates'][temp_elem][
+                         'cells']]
+            for cell in cells:
+                rpt_name = currentTemplateSets_data[currentTemplate]['templates'][temp_elem][
+                    'name']
+                try:
+                    businessFormula = currentTemplateSets_data[currentTemplate]['templates'][temp_elem]['cells'][cell][
+                        'businessFormula']
+                    if 'getDynamicValue' in businessFormula:
+                        business_Formula_cutted = businessFormula[
+                                                  businessFormula.find('(') + 2:businessFormula.find(')') - 1]
+                        rpt_dym_list.append([business_Formula_cutted, rpt_name])
+                except KeyError:
+                    continue
+    rpt_dym_df = pd.DataFrame(rpt_dym_list, columns=['Dimension', 'Report'])
+    return rpt_dym_df
+
+
+def get_dom_values(data_currentFields, data_currentDomains):
+    '''
+    Get full information about exist dimension, domains and available values for domains
+    input: data frame from get_module_reports function and json file
+    output: data frame with Domain, Domain_value, Dom_Val_Description
+    '''
+    domDimList = []
+    currentFields = [x for x in data_currentFields]
+    currentDomains = [x for x in data_currentDomains]
+    for dom in currentDomains:
+        domValuesList = data_currentDomains[dom]['values']
+        domValCap = ''
+        domValName = ''
+        for domVal in domValuesList:
+            if 'displayName' in data_currentDomains[dom]['values'][domVal]:
+                domValName = data_currentDomains[dom]['values'][domVal]['displayName']
+                domValCap = data_currentDomains[dom]['values'][domVal]['caption']['texts']['EN']
+            for dim in currentFields:
+                domainName = data_currentFields[dim]['domainName']
+                if dom == domainName:
+                    domDimList.append([dom, domValName, domValCap, dim])
+    domain_df = pd.DataFrame(domDimList, columns=['Domain', 'DomainValues', 'DomainCaptions', 'Dimension'])
+    return domain_df
+
+
+def get_rpt_full_path(data_currentRootModules):
+    '''
+    Get list of the exist modules and subfloders for each report, for getting full path to each report
+    '''
+    path_list = []
+    currentRootModules = [x for x in data_currentRootModules]
+    for root_mod_elem in currentRootModules:
+        if "CON" in root_mod_elem:
+            modules = data_currentRootModules[root_mod_elem]['modules']
+            for mod_elem in modules:
+                mod_elem_name = data_currentRootModules[root_mod_elem]['modules'][mod_elem]['name']
+                fr_mod = data_currentRootModules[root_mod_elem]['modules'][mod_elem]['modules']
+                for fr_mod_elem in fr_mod:
+                    fr_mod_elem_name = \
+                        data_currentRootModules[root_mod_elem]['modules'][mod_elem]['modules'][fr_mod_elem][
+                            'name']
+                    reports = data_currentRootModules[root_mod_elem]['modules'][mod_elem]['modules'][fr_mod_elem][
+                        'reports']
+                    for reports_elem in reports:
+                        path = root_mod_elem + '.' + mod_elem_name + '.' + fr_mod_elem_name
+                        path_list.append([path, reports_elem])
+    path_df = pd.DataFrame(path_list, columns=['Path', 'Report'])
+    return path_df
+
+
+def updatingReportsCellAdress(parsable_items, df, rule_id, full_path, df_dim_dom_rpt):
+    '''
+    getAbacusPath function (Updating Cell address to XML way). Adding full path to each report,
+    _get_z_axis (function converting Z axis to XML way)
+    '''
+    for item in parsable_items:
+        if re.search("RB", item):
+            splitted_frm = re.split(',', item.strip())
+            report = splitted_frm[0][1:]
+            if re.search('Z', splitted_frm[1]):
+                z_axis = splitted_frm[1]
+                row = splitted_frm[2]
+                col = splitted_frm[3][:-1]
+                updatedCellAdress = getAbacusPath(report.strip(), row.strip(), col.strip())
+                updatedCellAdress = _get_z_axis(z_axis, updatedCellAdress, df_dim_dom_rpt)
+            else:
+                row = splitted_frm[1]
+                col = splitted_frm[2][:-1]
+                updatedCellAdress = getAbacusPath(report.strip(), row.strip(), col.strip())
+            if updatedCellAdress is not None:
+                for path, path_rpt in zip(full_path['Path'], full_path['Report']):
+                    if path_rpt in updatedCellAdress:
+                        updatedCellAdress = updatedCellAdress.replace(path_rpt, path + '.' + path_rpt)
+                for i in range(len(parsable_items)):
+                    if parsable_items[i] == item:
+                        parsable_items[i] = updatedCellAdress
+            else:
+                df_1 = pd.DataFrame(df[df['Référence'].str.contains(rule_id)].copy())
+                df_1.to_excel('./output/Excluded_validation_rules.xlsx')
+                df.drop(df[df['Référence'] == rule_id].index, inplace=True)  # Deleting rule that out of the scope
+    parsable_items = ''.join(map(str, parsable_items))
+    df.loc[df.Référence == rule_id, 'XML_Rule'] = parsable_items
+    return df
+
+
+def _get_z_axis(original_z_axis, updated_rpt_address, df_dim_dom_rpt):
+    '''
+    Updating Z-axis to abacus way
+    Income: Z axis name as per Excel file
+            Converter to XML way cell address
+            Data frame with list of all dimension and domain with value and reports
+    '''
+    address_rpt = updated_rpt_address[:updated_rpt_address.find('!')]
+    original_z_axis = original_z_axis.strip()[2:-1]
+    for domVal, domValCap, dim, rptRpt in zip(df_dim_dom_rpt['DomainValues'], df_dim_dom_rpt['DomainCaptions'],
+                                              df_dim_dom_rpt['Dimension'], df_dim_dom_rpt['Report']):
+        if rptRpt == address_rpt and original_z_axis == domValCap.lower():  # Filter by Report name and domain values
+            new_z_axis = '{' + dim + '=\'' + domVal + '\'' + '}'
+            updated_rpt_address = updated_rpt_address.replace('![', '!' + new_z_axis + '[')
+    return updated_rpt_address
+
+
+def updatingRegionReference(df):
+    '''
+    Updating "Region reference" to XML way. Changing <= and >= to XML way
+    '''
+    for xml_rule, rule_id, exp in zip(df['XML_Rule'], df['Référence'], df['Expression']):
+        if re.search('si Remise', xml_rule):
+            xml_rule = xml_rule.replace('si Remise = France unizone,',
+                                        ' checkWhen="getBankInfo(\'FI_ISOCODE\') = \'FR\'" formula= "')
+            xml_rule = xml_rule.replace('si Remise = Reste du monde unizone,',
+                                        ' checkWhen="not(getBankInfo(\'FI_ISOCODE\') = \'FR\')" formula= "')
+        else:
+            xml_rule = 'formula="' + xml_rule
+        if '+ <='  in xml_rule:  # Check if '+ <='  exist in the formulas
+            xml_rule = xml_rule.replace('+ <=', '<=')
+        xml_rule = re.sub('<=|< =', '&lt;=', xml_rule)
+        xml_rule = re.sub('>=|> =', '&gt;=', xml_rule)
+        new_xml_rule = '<rule id="' + rule_id + '" ' + xml_rule + '" />'
+        xml_com = '<!--' + exp + '-->'
+        df.loc[df.Référence == rule_id, 'XML_Rule'] = new_xml_rule
+        df.loc[df.Référence == rule_id, 'XML_Comment'] = xml_com
+    return df
+
+
+def main():
+    df = getExcelToDataFrame(VALIDATION_RULE_EXCEL_FILE)
+    df = updatingFormulas(df)
+    df_1 = df[['XML_Comment', 'XML_Rule']].stack()
+    df.to_excel("./output/france_mapped_validations.xlsx")
+    with open("./output/france_mapped_rules.xml", "w", encoding="utf-8") as f_out:
+        f_out.write(
+            '<?xml version="1.0"?>\n<validation xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\nxsi:noNamespaceSchemaLocation="../../../engine/params/xsd/validation.xsd">\n<module name="RUBA_ALLOC_RUBA_F_CON">\n\n')
+        f_out.write('\n'.join(df_1))
+        f_out.write('\n\n</module>\n</validation>')
+
+
+main()
+print('done')
+
