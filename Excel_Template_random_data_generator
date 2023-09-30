@@ -1,0 +1,66 @@
+import random
+import re
+import openpyxl
+import pandas as pd
+import os
+import shutil
+
+'''
+Main function for running a scrip and creating of the pathes for input and output
+'''
+def main():
+    input_file_path = './input'
+    file = os.listdir(input_file_path)
+    path = os.path.join(input_file_path,''.join(file))
+    output_file_path = './output'
+    output_file = file[0][:file[0].find('CON') + 3] + '.xlsx'
+    output_path = os.path.join(output_file_path,output_file)
+    wb = openpyxl.load_workbook(path)
+    range_df= get_ranges(wb)
+    update_z_drop_down_val(range_df, wb, output_path)
+    multiplying_consolidations(output_file_path,output_file)
+
+def get_ranges(wb):
+    dd_list = []
+    for ws in wb:
+        for dv in ws.data_validations.dataValidation:
+            if dv.type == 'list':
+                if '!' in str(dv.formula1):
+                    cell = re.split('!', str(dv.formula1))
+                    dd_list.append([ws.title,str(dv.cells),cell[1]])
+    range_df = pd.DataFrame(dd_list, columns=['Report', 'Cell', 'Range'])
+    return range_df
+
+def update_z_drop_down_val(range_df,wb, path):
+    dom_sheet = ''
+    for ws in wb:
+        if ws.title == '_DomainValues':
+            dom_sheet = ws
+    for rpt, cell, range in zip(range_df['Report'],range_df['Cell'],range_df['Range']):
+        if rpt != 'Cover Sheet':
+            sheet = wb[rpt]
+            for range_cell in dom_sheet[range]:
+                for i in range_cell:
+                    sheet[cell] = dom_sheet[i.coordinate].value
+    for ws in wb:
+        for dv in ws.data_validations.dataValidation:
+            if dv.type == 'decimal':
+                ws[str(dv.sqref)] = random.randint(100000,1000000)
+    wb.save(path)
+
+def multiplying_consolidations(output_file_path, file):
+    list_conso = ['INT', 'IND']
+    for const in list_conso:
+        file_name = re.sub('CON',const,file)
+        path = shutil.copy(os.path.join(output_file_path,file), os.path.join(output_file_path,file_name))
+        wb = openpyxl.load_workbook(path)
+        for ws in wb:
+            for row in ws.rows:
+                for cell in row:
+                    if re.search('_CON|_con', str(cell.value)):
+                        up_cell = re.sub('CON',const,cell.value)
+                        up_cell = re.sub('con',const.lower(),up_cell)
+                        ws[cell.coordinate] = up_cell
+        wb.save(path)
+
+main()
